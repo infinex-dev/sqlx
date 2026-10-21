@@ -75,7 +75,7 @@ pub use self::connection::PoolConnection;
 use self::inner::PoolInner;
 #[doc(hidden)]
 pub use self::maybe::MaybePoolConnection;
-pub use self::options::{PoolConnectionMetadata, PoolOptions};
+pub use self::options::{CheckoutToken, PoolConnectionMetadata, PoolOptions};
 
 #[macro_use]
 mod executor;

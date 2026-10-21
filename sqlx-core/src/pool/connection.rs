@@ -11,7 +11,7 @@ use crate::database::Database;
 use crate::error::Error;
 
 use super::inner::{is_beyond_max_lifetime, DecrementSizeGuard, PoolInner};
-use crate::pool::options::PoolConnectionMetadata;
+use crate::pool::options::{CheckoutToken, PoolConnectionMetadata};
 
 const CLOSE_ON_DROP_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -22,6 +22,8 @@ pub struct PoolConnection<DB: Database> {
     live: Option<Live<DB>>,
     close_on_drop: bool,
     pub(crate) pool: Arc<PoolInner<DB>>,
+    // Dropped with the `PoolConnection`, in the task that drops it; see `PoolOptions::on_checkout`.
+    _checkout: Option<CheckoutToken>,
 }
 
 pub(super) struct Live<DB: Database> {
@@ -258,10 +260,16 @@ impl<DB: Database> Floating<DB, Live<DB>> {
         let pool = Arc::clone(&guard.pool);
 
         guard.cancel();
+        let _checkout = pool
+            .options
+            .on_checkout
+            .as_ref()
+            .and_then(|callback| callback());
         PoolConnection {
             live: Some(inner),
             close_on_drop: false,
             pool,
+            _checkout,
         }
     }
 
