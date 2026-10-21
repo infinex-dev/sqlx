@@ -42,6 +42,65 @@ async fn pool_should_invoke_after_connect() -> anyhow::Result<()> {
 
 // https://github.com/launchbadge/sqlx/issues/527
 #[sqlx_macros::test]
+async fn pool_should_hold_checkout_token_until_connection_is_given_up() -> anyhow::Result<()> {
+    sqlx::any::install_default_drivers();
+
+    struct Token(Arc<AtomicUsize>);
+
+    impl Drop for Token {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    let held = Arc::new(AtomicUsize::new(0));
+
+    let pool = AnyPoolOptions::new()
+        .max_connections(2)
+        .on_checkout({
+            let held = held.clone();
+            move || {
+                held.fetch_add(1, Ordering::SeqCst);
+                Some(Box::new(Token(held.clone())) as sqlx::pool::CheckoutToken)
+            }
+        })
+        .connect(&dotenvy::var("DATABASE_URL")?)
+        .await?;
+
+    let first = pool.acquire().await?;
+    assert_eq!(held.load(Ordering::SeqCst), 1);
+    let mut tx = pool.begin().await?;
+    assert_eq!(held.load(Ordering::SeqCst), 2);
+    tx.execute("SELECT 1").await?;
+    tx.commit().await?;
+    // The token goes with the connection, not when the pool takes it back.
+    assert_eq!(held.load(Ordering::SeqCst), 1);
+    drop(first);
+    assert_eq!(held.load(Ordering::SeqCst), 0);
+
+    pool.execute("SELECT 1").await?;
+    assert_eq!(held.load(Ordering::SeqCst), 0);
+
+    let detached = pool.acquire().await?.detach();
+    assert_eq!(held.load(Ordering::SeqCst), 0);
+    drop(detached);
+
+    for _ in 0..1000 {
+        if pool.num_idle() > 0 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let tried = pool.try_acquire();
+    assert!(tried.is_some());
+    assert_eq!(held.load(Ordering::SeqCst), 1);
+    drop(tried);
+    assert_eq!(held.load(Ordering::SeqCst), 0);
+
+    Ok(())
+}
+
+#[sqlx_macros::test]
 async fn pool_should_be_returned_failed_transactions() -> anyhow::Result<()> {
     sqlx::any::install_default_drivers();
 

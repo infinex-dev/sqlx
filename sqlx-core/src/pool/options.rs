@@ -5,6 +5,7 @@ use crate::pool::inner::PoolInner;
 use crate::pool::Pool;
 use futures_core::future::BoxFuture;
 use log::LevelFilter;
+use std::any::Any;
 use std::fmt::{self, Debug, Formatter};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -74,6 +75,7 @@ pub struct PoolOptions<DB: Database> {
                 + Sync,
         >,
     >,
+    pub(crate) on_checkout: Option<Arc<dyn Fn() -> Option<CheckoutToken> + 'static + Send + Sync>>,
     pub(crate) max_connections: u32,
     pub(crate) acquire_time_level: LevelFilter,
     pub(crate) acquire_slow_level: LevelFilter,
@@ -97,6 +99,7 @@ impl<DB: Database> Clone for PoolOptions<DB> {
             after_connect: self.after_connect.clone(),
             before_acquire: self.before_acquire.clone(),
             after_release: self.after_release.clone(),
+            on_checkout: self.on_checkout.clone(),
             max_connections: self.max_connections,
             acquire_time_level: self.acquire_time_level,
             acquire_slow_threshold: self.acquire_slow_threshold,
@@ -110,6 +113,10 @@ impl<DB: Database> Clone for PoolOptions<DB> {
         }
     }
 }
+
+/// What a [`PoolOptions::on_checkout`] callback returns, kept with the connection it was
+/// handed out with and dropped when that connection is given up.
+pub type CheckoutToken = Box<dyn Any + Send + Sync>;
 
 /// Metadata for the connection being processed by a [`PoolOptions`] callback.
 #[derive(Debug)] // Don't want to commit to any other trait impls yet.
@@ -146,6 +153,7 @@ impl<DB: Database> PoolOptions<DB> {
             after_connect: None,
             before_acquire: None,
             after_release: None,
+            on_checkout: None,
             test_before_acquire: true,
             // A production application will want to set a higher limit than this.
             max_connections: 10,
@@ -497,6 +505,26 @@ impl<DB: Database> PoolOptions<DB> {
             + Sync,
     {
         self.after_release = Some(Arc::new(callback));
+        self
+    }
+
+    /// Call `callback` each time the pool hands a connection out, from
+    /// [`Pool::acquire`] or [`Pool::try_acquire`] (and so from `begin` and from
+    /// the pool's `Executor` methods), in the task that asked for it.
+    ///
+    /// The token it returns, if any, is kept with the [`PoolConnection`][super::PoolConnection]
+    /// and dropped when that is: when the connection is returned, detached, leaked or closed,
+    /// synchronously, in the task that drops it. Unlike [`after_release`][Self::after_release],
+    /// which runs later in a task of the pool's own, the token's drop marks the moment user code
+    /// gives the connection up.
+    ///
+    /// This lets an application count the connections a unit of work holds at once, for example
+    /// against a task-local budget. The callback runs on every checkout, so it should be cheap.
+    pub fn on_checkout<F>(mut self, callback: F) -> Self
+    where
+        F: Fn() -> Option<CheckoutToken> + 'static + Send + Sync,
+    {
+        self.on_checkout = Some(Arc::new(callback));
         self
     }
 
